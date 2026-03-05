@@ -739,6 +739,16 @@ fn render_list(f: &mut Frame, app: &App, area: Rect) {
         layout[1],
     );
 
+    if visible.is_empty() && !app.search_query.is_empty() {
+        let empty_msg = Paragraph::new(Line::from(vec![
+            Span::styled("  No articles matching \"", Style::default().fg(theme::FG_DIM)),
+            Span::styled(&app.search_query, Style::default().fg(Color::White)),
+            Span::styled("\"", Style::default().fg(theme::FG_DIM)),
+        ]));
+        f.render_widget(empty_msg, layout[2]);
+        return;
+    }
+
     let items: Vec<ListItem> = visible
         .iter()
         .map(|article| {
@@ -991,8 +1001,12 @@ fn render_detail(f: &mut Frame, app: &App, area: Rect) {
         ]));
     }
 
+    let total_lines = lines.len() as u16;
+    let max_scroll = total_lines.saturating_sub(inner.height / 2);
+    let scroll = app.scroll_offset.min(max_scroll);
+
     let paragraph = Paragraph::new(Text::from(lines))
-        .scroll((app.scroll_offset, 0))
+        .scroll((scroll, 0))
         .block(
             Block::default()
                 .borders(Borders::LEFT)
@@ -1001,6 +1015,34 @@ fn render_detail(f: &mut Frame, app: &App, area: Rect) {
         );
 
     f.render_widget(paragraph, inner);
+
+    // Scroll position indicator
+    if total_lines > inner.height {
+        let pct = if max_scroll == 0 {
+            100
+        } else {
+            ((scroll as u32 * 100) / max_scroll as u32).min(100)
+        };
+        let label = if scroll == 0 {
+            " TOP ".to_string()
+        } else if pct >= 100 {
+            " END ".to_string()
+        } else {
+            format!(" {pct}% ")
+        };
+        let indicator = Paragraph::new(Span::styled(
+            &label,
+            Style::default().fg(theme::FG_DIM).bg(theme::FOOTER_BG),
+        ))
+        .alignment(ratatui::layout::Alignment::Right);
+        let indicator_area = Rect {
+            x: inner.x,
+            y: inner.y + inner.height.saturating_sub(1),
+            width: inner.width,
+            height: 1,
+        };
+        f.render_widget(indicator, indicator_area);
+    }
 }
 
 fn render_footer(f: &mut Frame, app: &App, area: Rect) {
@@ -1030,12 +1072,14 @@ fn render_footer(f: &mut Frame, app: &App, area: Rect) {
         View::Detail => vec![
             Span::styled(" Esc ", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
             Span::styled("back  ", Style::default().fg(theme::FG_DIM)),
-            Span::styled("↑/↓ j/k ", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+            Span::styled("↑/↓ ", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
             Span::styled("scroll  ", Style::default().fg(theme::FG_DIM)),
+            Span::styled("n/N ", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+            Span::styled("next/prev  ", Style::default().fg(theme::FG_DIM)),
             Span::styled("o ", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
             Span::styled("open  ", Style::default().fg(theme::FG_DIM)),
             Span::styled("y ", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
-            Span::styled("copy link  ", Style::default().fg(theme::FG_DIM)),
+            Span::styled("copy  ", Style::default().fg(theme::FG_DIM)),
             Span::styled("b ", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
             Span::styled("bookmark  ", Style::default().fg(theme::FG_DIM)),
             Span::styled("q ", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
@@ -1133,7 +1177,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             result = poll_event() => {
                 if let Some((key_code, modifiers)) = result {
-                    let page_size = 10;
+                    let term_height = terminal.size().map(|s| s.height).unwrap_or(24);
+                    let page_size = (term_height / 2) as usize;
 
                     match app.view {
                         View::List if app.search_active => match key_code {
@@ -1231,6 +1276,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             }
                             KeyCode::Char('u') if modifiers.contains(KeyModifiers::CONTROL) => {
                                 app.scroll_offset = app.scroll_offset.saturating_sub(page_size as u16);
+                            }
+                            KeyCode::Char('n') | KeyCode::Right => {
+                                app.next_article();
+                                app.scroll_offset = 0;
+                                if let Some(article) = app.selected_article() {
+                                    let link = article.link.clone();
+                                    app.store.mark_read(&link);
+                                    if !link.is_empty() && !app.content_cache.contains_key(&link) {
+                                        app.loading_article = Some(link.clone());
+                                        spawn_article_fetch(link, &tx);
+                                    }
+                                }
+                            }
+                            KeyCode::Char('N') | KeyCode::Left => {
+                                app.prev_article();
+                                app.scroll_offset = 0;
+                                if let Some(article) = app.selected_article() {
+                                    let link = article.link.clone();
+                                    app.store.mark_read(&link);
+                                    if !link.is_empty() && !app.content_cache.contains_key(&link) {
+                                        app.loading_article = Some(link.clone());
+                                        spawn_article_fetch(link, &tx);
+                                    }
+                                }
                             }
                             KeyCode::Char('o') => {
                                 if let Some(article) = app.selected_article() {
