@@ -1,4 +1,7 @@
+mod config;
+
 use chrono::{DateTime, FixedOffset, Utc};
+use config::{parse_hex_color, Config};
 use crossterm::{
     event::{self, Event, KeyCode, KeyEventKind},
     execute,
@@ -31,9 +34,6 @@ mod theme {
     pub const BREAKING_ACCENT: Color = Color::Rgb(255, 80, 80);
     pub const FOOTER_BG: Color = Color::Rgb(25, 25, 35);
     pub const SPINNER: Color = Color::Rgb(120, 120, 200);
-
-    pub const CNN: Color = Color::Rgb(204, 50, 50);
-    pub const CNBC: Color = Color::Rgb(0, 136, 204);
 }
 
 // ── Feed sources ──────────────────────────────────────────────────────────────
@@ -45,22 +45,19 @@ struct FeedSource {
     accent: Color,
 }
 
-fn default_feeds() -> Vec<FeedSource> {
-    vec![
-        FeedSource {
-            name: "CNN".into(),
-            url: "http://rss.cnn.com/rss/edition.rss".into(),
-            accent: theme::CNN,
-        },
-        FeedSource {
-            name: "CNBC".into(),
-            url: "https://search.cnbc.com/rs/search/combinedcms/view.xml?partnerId=wrss01&id=100003114".into(),
-            accent: theme::CNBC,
-        },
-    ]
+impl FeedSource {
+    fn from_config(feeds: &[config::FeedConfig]) -> Vec<Self> {
+        feeds
+            .iter()
+            .map(|f| FeedSource {
+                name: f.name.clone(),
+                url: f.url.clone(),
+                accent: parse_hex_color(&f.color),
+            })
+            .collect()
+    }
 }
 
-const BREAKING_COUNT: usize = 3;
 const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
 // ── Article model ─────────────────────────────────────────────────────────────
@@ -115,6 +112,7 @@ enum View {
 
 struct App {
     feeds: Vec<FeedSource>,
+    breaking_count: usize,
     breaking: Vec<Article>,
     articles: Vec<Article>,
     list_state: ListState,
@@ -127,9 +125,10 @@ struct App {
 }
 
 impl App {
-    fn new(feeds: Vec<FeedSource>) -> Self {
+    fn new(feeds: Vec<FeedSource>, breaking_count: usize) -> Self {
         Self {
             feeds,
+            breaking_count,
             breaking: Vec::new(),
             articles: Vec::new(),
             list_state: ListState::default(),
@@ -171,10 +170,10 @@ impl App {
     fn populate(&mut self, mut all: Vec<Article>) {
         all.sort_by(|a, b| b.parsed_date.cmp(&a.parsed_date));
 
-        self.breaking = all.iter().take(BREAKING_COUNT).cloned().collect();
-        self.articles = all.into_iter().skip(BREAKING_COUNT).collect();
+        self.breaking = all.iter().take(self.breaking_count).cloned().collect();
+        self.articles = all.into_iter().skip(self.breaking_count).collect();
 
-        if !self.articles.is_empty() {
+        if !self.articles.is_empty() && self.list_state.selected().is_none() {
             self.list_state.select(Some(0));
         }
         self.last_updated = Some(Utc::now());
@@ -269,13 +268,19 @@ fn spawn_fetch(feeds: Vec<FeedSource>, tx: &mpsc::UnboundedSender<FetchResult>) 
 // ── UI rendering ──────────────────────────────────────────────────────────────
 
 fn ui(f: &mut Frame, app: &App) {
+    let breaking_height = if app.breaking.is_empty() {
+        0
+    } else {
+        (app.breaking.len() as u16) + 3
+    };
+
     let outer = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3),                                        // header
-            Constraint::Length((BREAKING_COUNT as u16).saturating_add(3)), // breaking
-            Constraint::Min(0),                                          // main list
-            Constraint::Length(1),                                        // footer
+            Constraint::Length(3),              // header
+            Constraint::Length(breaking_height), // breaking
+            Constraint::Min(0),                // main list
+            Constraint::Length(1),              // footer
         ])
         .split(f.area());
 
@@ -660,27 +665,31 @@ fn short_date(date: &str) -> String {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let cfg = Config::load();
+    let feeds = FeedSource::from_config(&cfg.feeds);
+    let auto_refresh = std::time::Duration::from_secs(cfg.auto_refresh_secs);
+
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
     let backend = ratatui::backend::CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let feeds = default_feeds();
-    let mut app = App::new(feeds.clone());
+    let mut app = App::new(feeds.clone(), cfg.breaking_count);
 
-    // Channel for background fetch results
     let (tx, mut rx) = mpsc::unbounded_channel::<FetchResult>();
 
-    // Kick off initial fetch in background
+    // Initial fetch
     spawn_fetch(feeds.clone(), &tx);
 
     let mut spinner_interval = tokio::time::interval(std::time::Duration::from_millis(80));
+    let mut auto_refresh_interval = tokio::time::interval(auto_refresh);
+    // Skip the first immediate tick (we already spawned initial fetch)
+    auto_refresh_interval.tick().await;
 
     loop {
         terminal.draw(|f| ui(f, &app))?;
 
-        // Check for fetch results (non-blocking)
         while let Ok(result) = rx.try_recv() {
             match result {
                 FetchResult::Success(articles) => app.populate(articles),
@@ -695,6 +704,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             _ = spinner_interval.tick() => {
                 if app.loading {
                     app.tick_spinner();
+                }
+            }
+            _ = auto_refresh_interval.tick() => {
+                if !app.loading {
+                    app.loading = true;
+                    app.error = None;
+                    spawn_fetch(feeds.clone(), &tx);
                 }
             }
             result = poll_event() => {
@@ -715,6 +731,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     app.loading = true;
                                     app.error = None;
                                     spawn_fetch(feeds.clone(), &tx);
+                                    auto_refresh_interval.reset();
                                 }
                             }
                             _ => {}

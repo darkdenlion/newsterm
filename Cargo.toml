@@ -1,6 +1,6 @@
 [package]
 name = "newsterm"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 
 [dependencies]
@@ -13,3 +13,6 @@ html-escape = "0.2"
 textwrap = "0.16"
 open = "5"
 chrono = "0.4"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+dirs = "6"
