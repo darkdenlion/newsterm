@@ -760,6 +760,7 @@ fn render_list(f: &mut Frame, app: &App, area: Rect) {
         return;
     }
 
+    let list_width = layout[2].width as usize;
     let items: Vec<ListItem> = visible
         .iter()
         .map(|article| {
@@ -775,12 +776,25 @@ fn render_list(f: &mut Frame, app: &App, area: Rect) {
 
             let bookmark_icon = if is_bookmarked { "★ " } else { "" };
 
+            // Calculate max title length: total width minus prefix and suffix
+            // prefix: " " + badge + "  " + bookmark_icon ≈ 3 + name.len() + 2 + bookmark
+            // suffix: "  " + age
+            let prefix_len = 3 + article.source.len() + 2 + bookmark_icon.len();
+            let suffix_len = 2 + age.len();
+            let max_title = list_width.saturating_sub(prefix_len + suffix_len + 4); // 4 for highlight symbol + padding
+
+            let title = if article.title.len() > max_title && max_title > 3 {
+                format!("{}…", &article.title[..max_title.min(article.title.len()).saturating_sub(1)])
+            } else {
+                article.title.clone()
+            };
+
             let line = Line::from(vec![
                 Span::styled(" ", Style::default()),
                 source_badge(&article.source, article.source_color),
                 Span::styled("  ", Style::default()),
                 Span::styled(bookmark_icon, Style::default().fg(theme::BOOKMARK)),
-                Span::styled(&article.title, title_style),
+                Span::styled(title, title_style),
                 Span::styled(
                     format!("  {age}"),
                     Style::default().fg(theme::FG_DIM),
@@ -794,7 +808,6 @@ fn render_list(f: &mut Frame, app: &App, area: Rect) {
         .highlight_style(
             Style::default()
                 .bg(theme::HIGHLIGHT_BG)
-                .fg(Color::White)
                 .add_modifier(Modifier::BOLD),
         )
         .highlight_symbol(" ▌");
