@@ -783,8 +783,9 @@ fn render_list(f: &mut Frame, app: &App, area: Rect) {
             let suffix_len = 2 + age.len();
             let max_title = list_width.saturating_sub(prefix_len + suffix_len + 4); // 4 for highlight symbol + padding
 
-            let title = if article.title.len() > max_title && max_title > 3 {
-                format!("{}…", &article.title[..max_title.min(article.title.len()).saturating_sub(1)])
+            let title = if article.title.chars().count() > max_title && max_title > 3 {
+                let truncated: String = article.title.chars().take(max_title.saturating_sub(1)).collect();
+                format!("{truncated}…")
             } else {
                 article.title.clone()
             };
@@ -922,6 +923,10 @@ fn render_detail(f: &mut Frame, app: &App, area: Rect) {
         Span::styled("", Style::default())
     };
 
+    let position = app.list_state.selected().map(|i| {
+        format!("  {}/{}", i + 1, app.visible_articles().len())
+    }).unwrap_or_default();
+
     lines.push(Line::from(vec![
         source_badge(&article.source, article.source_color),
         Span::styled(
@@ -929,6 +934,7 @@ fn render_detail(f: &mut Frame, app: &App, area: Rect) {
             Style::default().fg(theme::FG_DIM),
         ),
         bookmark_span,
+        Span::styled(position, Style::default().fg(theme::FG_MUTED)),
     ]));
     lines.push(Line::default());
 
