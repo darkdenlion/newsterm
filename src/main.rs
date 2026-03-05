@@ -30,10 +30,10 @@ use tokio::sync::mpsc;
 mod theme {
     use ratatui::style::Color;
 
-    pub const FG: Color = Color::Rgb(200, 200, 200);
+    pub const FG: Color = Color::Rgb(220, 220, 220);
     pub const FG_DIM: Color = Color::Rgb(100, 100, 110);
     pub const FG_MUTED: Color = Color::Rgb(140, 140, 150);
-    pub const FG_READ: Color = Color::Rgb(80, 80, 90);
+    pub const FG_READ: Color = Color::Rgb(90, 90, 100);
     pub const HIGHLIGHT_BG: Color = Color::Rgb(35, 35, 50);
     pub const BORDER: Color = Color::Rgb(50, 50, 65);
     pub const BREAKING_BG: Color = Color::Rgb(40, 20, 20);
@@ -890,16 +890,24 @@ fn render_preview(f: &mut Frame, app: &App, area: Rect) {
     lines.push(Line::default());
 
     let wrap_width = content_width.min(70);
-    let desc_wrapped = wrap(&article.description, wrap_width);
-    for l in &desc_wrapped {
-        lines.push(Line::from(Span::styled(
-            l.to_string(),
-            Style::default().fg(theme::FG),
-        )));
+    for paragraph in article.description.split('\n') {
+        let trimmed = paragraph.trim();
+        if trimmed.is_empty() {
+            lines.push(Line::default());
+        } else {
+            let para_wrapped = wrap(trimmed, wrap_width);
+            for l in &para_wrapped {
+                lines.push(Line::from(Span::styled(
+                    l.to_string(),
+                    Style::default().fg(theme::FG),
+                )));
+            }
+            lines.push(Line::default());
+        }
     }
 
-    let paragraph = Paragraph::new(Text::from(lines));
-    f.render_widget(paragraph, inner);
+    let para = Paragraph::new(Text::from(lines));
+    f.render_widget(para, inner);
 }
 
 fn render_detail(f: &mut Frame, app: &App, area: Rect) {
@@ -910,9 +918,10 @@ fn render_detail(f: &mut Frame, app: &App, area: Rect) {
 
     f.render_widget(Clear, area);
 
+    let h_margin = if area.width > 120 { 8 } else if area.width > 80 { 6 } else { 3 };
     let inner = area.inner(Margin {
         vertical: 1,
-        horizontal: 4,
+        horizontal: h_margin,
     });
 
     let content_width = inner.width.saturating_sub(2) as usize;
@@ -967,15 +976,23 @@ fn render_detail(f: &mut Frame, app: &App, area: Rect) {
     lines.push(Line::default());
 
     // Show full article content if available, otherwise show loading or RSS description
-    let wrap_width = content_width.min(80);
+    let wrap_width = content_width.min(72);
     if let Some(content) = app.content_cache.get(&article.link) {
         if wrap_width > 0 {
-            let content_wrapped = wrap(content, wrap_width);
-            for l in &content_wrapped {
-                lines.push(Line::from(Span::styled(
-                    l.to_string(),
-                    Style::default().fg(theme::FG),
-                )));
+            for paragraph in content.split('\n') {
+                let trimmed = paragraph.trim();
+                if trimmed.is_empty() {
+                    lines.push(Line::default());
+                } else {
+                    let para_wrapped = wrap(trimmed, wrap_width);
+                    for l in &para_wrapped {
+                        lines.push(Line::from(Span::styled(
+                            l.to_string(),
+                            Style::default().fg(theme::FG),
+                        )));
+                    }
+                    lines.push(Line::default());
+                }
             }
         }
     } else if app.is_loading_current_article() {
@@ -1008,12 +1025,20 @@ fn render_detail(f: &mut Frame, app: &App, area: Rect) {
     } else {
         // Fallback: just show RSS description
         if wrap_width > 0 {
-            let desc_wrapped = wrap(&article.description, wrap_width);
-            for l in &desc_wrapped {
-                lines.push(Line::from(Span::styled(
-                    l.to_string(),
-                    Style::default().fg(theme::FG),
-                )));
+            for paragraph in article.description.split('\n') {
+                let trimmed = paragraph.trim();
+                if trimmed.is_empty() {
+                    lines.push(Line::default());
+                } else {
+                    let para_wrapped = wrap(trimmed, wrap_width);
+                    for l in &para_wrapped {
+                        lines.push(Line::from(Span::styled(
+                            l.to_string(),
+                            Style::default().fg(theme::FG),
+                        )));
+                    }
+                    lines.push(Line::default());
+                }
             }
         }
     }
