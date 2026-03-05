@@ -18,6 +18,7 @@ use ratatui::{
     Frame, Terminal,
 };
 use rss::Channel;
+use std::collections::HashMap;
 use std::io;
 use store::Store;
 use textwrap::wrap;
@@ -101,11 +102,13 @@ impl Article {
     }
 }
 
-// ── Background fetch message ──────────────────────────────────────────────────
+// ── Background messages ───────────────────────────────────────────────────────
 
-enum FetchResult {
-    Success(Vec<Article>),
-    Error(String),
+enum AppMessage {
+    FeedResult(Vec<Article>),
+    FeedError(String),
+    ArticleContent { link: String, content: String },
+    ArticleFetchError { link: String, error: String },
 }
 
 // ── App state ─────────────────────────────────────────────────────────────────
@@ -133,6 +136,10 @@ struct App {
     search_query: String,
     store: Store,
     toast: Option<(String, std::time::Instant)>,
+    // Article content cache: link -> full text
+    content_cache: HashMap<String, String>,
+    // Currently loading article content for this link
+    loading_article: Option<String>,
 }
 
 impl App {
@@ -154,6 +161,8 @@ impl App {
             search_query: String::new(),
             store: Store::load(),
             toast: None,
+            content_cache: HashMap::new(),
+            loading_article: None,
         }
     }
 
@@ -284,11 +293,21 @@ impl App {
         }
         None
     }
+
+    fn is_loading_current_article(&self) -> bool {
+        if let (Some(loading_link), Some(article)) =
+            (&self.loading_article, self.selected_article())
+        {
+            loading_link == &article.link
+        } else {
+            false
+        }
+    }
 }
 
 // ── Fetch RSS ─────────────────────────────────────────────────────────────────
 
-async fn fetch_all_feeds(feeds: &[FeedSource]) -> FetchResult {
+async fn fetch_all_feeds(feeds: &[FeedSource]) -> (Vec<Article>, Vec<String>) {
     let mut all = Vec::new();
     let mut errors = Vec::new();
 
@@ -299,11 +318,7 @@ async fn fetch_all_feeds(feeds: &[FeedSource]) -> FetchResult {
         }
     }
 
-    if all.is_empty() && !errors.is_empty() {
-        FetchResult::Error(errors.join("; "))
-    } else {
-        FetchResult::Success(all)
-    }
+    (all, errors)
 }
 
 async fn fetch_feed(source: &FeedSource) -> Result<Vec<Article>, String> {
@@ -344,6 +359,64 @@ async fn fetch_feed(source: &FeedSource) -> Result<Vec<Article>, String> {
     Ok(articles)
 }
 
+// ── Article content extraction ────────────────────────────────────────────────
+
+async fn fetch_article_content(link: &str) -> Result<String, String> {
+    let response = reqwest::get(link)
+        .await
+        .map_err(|e| format!("Request failed: {e}"))?;
+
+    let html = response
+        .text()
+        .await
+        .map_err(|e| format!("Read failed: {e}"))?;
+
+    let url = url::Url::parse(link).map_err(|e| format!("URL parse failed: {e}"))?;
+
+    // Use readability to extract the main content
+    let mut cursor = std::io::Cursor::new(html.as_bytes());
+    match readability::extractor::extract(&mut cursor, &url) {
+        Ok(product) => {
+            let text = strip_html(&product.content);
+            if text.is_empty() {
+                Err("Could not extract article content".into())
+            } else {
+                Ok(text)
+            }
+        }
+        Err(e) => Err(format!("Extraction failed: {e}")),
+    }
+}
+
+fn spawn_feed_fetch(feeds: Vec<FeedSource>, tx: &mpsc::UnboundedSender<AppMessage>) {
+    let tx = tx.clone();
+    tokio::spawn(async move {
+        let (articles, errors) = fetch_all_feeds(&feeds).await;
+        if articles.is_empty() && !errors.is_empty() {
+            let _ = tx.send(AppMessage::FeedError(errors.join("; ")));
+        } else {
+            let _ = tx.send(AppMessage::FeedResult(articles));
+        }
+    });
+}
+
+fn spawn_article_fetch(link: String, tx: &mpsc::UnboundedSender<AppMessage>) {
+    let tx = tx.clone();
+    tokio::spawn(async move {
+        match fetch_article_content(&link).await {
+            Ok(content) => {
+                let _ = tx.send(AppMessage::ArticleContent {
+                    link,
+                    content,
+                });
+            }
+            Err(error) => {
+                let _ = tx.send(AppMessage::ArticleFetchError { link, error });
+            }
+        }
+    });
+}
+
 fn strip_html(input: &str) -> String {
     let mut output = String::with_capacity(input.len());
     let mut in_tag = false;
@@ -355,15 +428,26 @@ fn strip_html(input: &str) -> String {
             _ => {}
         }
     }
-    output.trim().to_string()
-}
-
-fn spawn_fetch(feeds: Vec<FeedSource>, tx: &mpsc::UnboundedSender<FetchResult>) {
-    let tx = tx.clone();
-    tokio::spawn(async move {
-        let result = fetch_all_feeds(&feeds).await;
-        let _ = tx.send(result);
-    });
+    // Collapse multiple blank lines into at most two newlines
+    let mut result = String::with_capacity(output.len());
+    let mut blank_count = 0;
+    for line in output.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            blank_count += 1;
+            if blank_count <= 1 {
+                result.push('\n');
+            }
+        } else {
+            blank_count = 0;
+            if !result.is_empty() && !result.ends_with('\n') {
+                result.push('\n');
+            }
+            result.push_str(trimmed);
+            result.push('\n');
+        }
+    }
+    result.trim().to_string()
 }
 
 // ── UI rendering ──────────────────────────────────────────────────────────────
@@ -378,10 +462,10 @@ fn ui(f: &mut Frame, app: &App) {
     let outer = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3),              // header
-            Constraint::Length(breaking_height), // breaking
-            Constraint::Min(0),                // main list
-            Constraint::Length(1),              // footer
+            Constraint::Length(3),
+            Constraint::Length(breaking_height),
+            Constraint::Min(0),
+            Constraint::Length(1),
         ])
         .split(f.area());
 
@@ -451,7 +535,6 @@ fn render_header(f: &mut Frame, app: &App, area: Rect) {
         (false, None) => String::new(),
     };
 
-    // Toast overrides the right side
     let right_str = if let Some(toast) = app.active_toast() {
         toast.to_string()
     } else {
@@ -608,7 +691,6 @@ fn render_list(f: &mut Frame, app: &App, area: Rect) {
         ])
         .split(inner);
 
-    // Search bar
     if search_height > 0 {
         let cursor = if app.search_active { "▊" } else { "" };
         let search_line = Line::from(vec![
@@ -730,7 +812,6 @@ fn render_preview(f: &mut Frame, app: &App, area: Rect) {
 
     let mut lines: Vec<Line> = Vec::new();
 
-    // Source + age
     let bookmark_span = if app.store.is_bookmarked(&article.link) {
         Span::styled(" ★", Style::default().fg(theme::BOOKMARK))
     } else {
@@ -747,7 +828,6 @@ fn render_preview(f: &mut Frame, app: &App, area: Rect) {
     ]));
     lines.push(Line::default());
 
-    // Title
     let title_wrapped = wrap(&article.title, content_width);
     for l in &title_wrapped {
         lines.push(Line::from(Span::styled(
@@ -759,7 +839,6 @@ fn render_preview(f: &mut Frame, app: &App, area: Rect) {
     }
     lines.push(Line::default());
 
-    // Date
     if !article.pub_date.is_empty() {
         lines.push(Line::from(Span::styled(
             &article.pub_date,
@@ -768,14 +847,12 @@ fn render_preview(f: &mut Frame, app: &App, area: Rect) {
         lines.push(Line::default());
     }
 
-    // Separator
     lines.push(Line::from(Span::styled(
         "─".repeat(content_width.min(50)),
         Style::default().fg(theme::BORDER),
     )));
     lines.push(Line::default());
 
-    // Description
     let wrap_width = content_width.min(70);
     let desc_wrapped = wrap(&article.description, wrap_width);
     for l in &desc_wrapped {
@@ -805,7 +882,6 @@ fn render_detail(f: &mut Frame, app: &App, area: Rect) {
     let content_width = inner.width.saturating_sub(2) as usize;
     let mut lines: Vec<Line> = Vec::new();
 
-    // Source badge + bookmark + age
     let bookmark_span = if app.store.is_bookmarked(&article.link) {
         Span::styled(" ★ bookmarked", Style::default().fg(theme::BOOKMARK))
     } else {
@@ -849,14 +925,55 @@ fn render_detail(f: &mut Frame, app: &App, area: Rect) {
     )));
     lines.push(Line::default());
 
+    // Show full article content if available, otherwise show loading or RSS description
     let wrap_width = content_width.min(80);
-    if wrap_width > 0 {
-        let desc_wrapped = wrap(&article.description, wrap_width);
-        for l in &desc_wrapped {
+    if let Some(content) = app.content_cache.get(&article.link) {
+        if wrap_width > 0 {
+            let content_wrapped = wrap(content, wrap_width);
+            for l in &content_wrapped {
+                lines.push(Line::from(Span::styled(
+                    l.to_string(),
+                    Style::default().fg(theme::FG),
+                )));
+            }
+        }
+    } else if app.is_loading_current_article() {
+        let spinner = app.spinner();
+        lines.push(Line::from(vec![
+            Span::styled(format!("  {spinner} "), Style::default().fg(theme::SPINNER)),
+            Span::styled(
+                "Loading full article...",
+                Style::default().fg(theme::FG_DIM),
+            ),
+        ]));
+        lines.push(Line::default());
+        // Show RSS description as preview while loading
+        if wrap_width > 0 && !article.description.is_empty() {
             lines.push(Line::from(Span::styled(
-                l.to_string(),
-                Style::default().fg(theme::FG),
+                "Preview:",
+                Style::default()
+                    .fg(theme::FG_MUTED)
+                    .add_modifier(Modifier::BOLD),
             )));
+            lines.push(Line::default());
+            let desc_wrapped = wrap(&article.description, wrap_width);
+            for l in &desc_wrapped {
+                lines.push(Line::from(Span::styled(
+                    l.to_string(),
+                    Style::default().fg(theme::FG_DIM),
+                )));
+            }
+        }
+    } else {
+        // Fallback: just show RSS description
+        if wrap_width > 0 {
+            let desc_wrapped = wrap(&article.description, wrap_width);
+            for l in &desc_wrapped {
+                lines.push(Line::from(Span::styled(
+                    l.to_string(),
+                    Style::default().fg(theme::FG),
+                )));
+            }
         }
     }
 
@@ -966,9 +1083,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut app = App::new(feeds.clone(), cfg.breaking_count);
 
-    let (tx, mut rx) = mpsc::unbounded_channel::<FetchResult>();
+    let (tx, mut rx) = mpsc::unbounded_channel::<AppMessage>();
 
-    spawn_fetch(feeds.clone(), &tx);
+    spawn_feed_fetch(feeds.clone(), &tx);
 
     let mut spinner_interval = tokio::time::interval(std::time::Duration::from_millis(80));
     let mut auto_refresh_interval = tokio::time::interval(auto_refresh);
@@ -977,19 +1094,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     loop {
         terminal.draw(|f| ui(f, &app))?;
 
-        while let Ok(result) = rx.try_recv() {
-            match result {
-                FetchResult::Success(articles) => app.populate(articles),
-                FetchResult::Error(e) => {
+        while let Ok(msg) = rx.try_recv() {
+            match msg {
+                AppMessage::FeedResult(articles) => app.populate(articles),
+                AppMessage::FeedError(e) => {
                     app.error = Some(e);
                     app.loading = false;
+                }
+                AppMessage::ArticleContent { link, content } => {
+                    if app.loading_article.as_deref() == Some(&link) {
+                        app.loading_article = None;
+                    }
+                    app.content_cache.insert(link, content);
+                }
+                AppMessage::ArticleFetchError { link, error } => {
+                    if app.loading_article.as_deref() == Some(&link) {
+                        app.loading_article = None;
+                    }
+                    // Store error message so user sees it
+                    app.content_cache
+                        .insert(link, format!("[Could not load full article: {error}]"));
                 }
             }
         }
 
         tokio::select! {
             _ = spinner_interval.tick() => {
-                if app.loading {
+                if app.loading || app.loading_article.is_some() {
                     app.tick_spinner();
                 }
             }
@@ -997,12 +1128,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if !app.loading {
                     app.loading = true;
                     app.error = None;
-                    spawn_fetch(feeds.clone(), &tx);
+                    spawn_feed_fetch(feeds.clone(), &tx);
                 }
             }
             result = poll_event() => {
                 if let Some((key_code, modifiers)) = result {
-                    // Ctrl+d / Ctrl+u for page down/up in both views
                     let page_size = 10;
 
                     match app.view {
@@ -1032,14 +1162,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 app.page_up(page_size);
                             }
                             KeyCode::Char('G') => {
-                                // Go to bottom
                                 let len = app.visible_articles().len();
                                 if len > 0 {
                                     app.list_state.select(Some(len - 1));
                                 }
                             }
                             KeyCode::Char('g') => {
-                                // Go to top
                                 if !app.visible_articles().is_empty() {
                                     app.list_state.select(Some(0));
                                 }
@@ -1050,6 +1178,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     app.store.mark_read(&link);
                                     app.scroll_offset = 0;
                                     app.view = View::Detail;
+
+                                    // Fetch full article if not cached
+                                    if !link.is_empty() && !app.content_cache.contains_key(&link) {
+                                        app.loading_article = Some(link.clone());
+                                        spawn_article_fetch(link, &tx);
+                                    }
                                 }
                             }
                             KeyCode::Char('/') => {
@@ -1075,7 +1209,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 if !app.loading {
                                     app.loading = true;
                                     app.error = None;
-                                    spawn_fetch(feeds.clone(), &tx);
+                                    spawn_feed_fetch(feeds.clone(), &tx);
                                     auto_refresh_interval.reset();
                                 }
                             }
