@@ -107,6 +107,7 @@ impl Article {
 enum AppMessage {
     FeedResult(Vec<Article>),
     FeedError(String),
+    PartialError(String),
     ArticleContent { link: String, content: String },
     ArticleFetchError { link: String, error: String },
 }
@@ -308,13 +309,19 @@ impl App {
 // ── Fetch RSS ─────────────────────────────────────────────────────────────────
 
 async fn fetch_all_feeds(feeds: &[FeedSource]) -> (Vec<Article>, Vec<String>) {
+    let futures: Vec<_> = feeds.iter().map(|source| {
+        let source = source.clone();
+        async move { (source.name.clone(), fetch_feed(&source).await) }
+    }).collect();
+
+    let results = futures::future::join_all(futures).await;
+
     let mut all = Vec::new();
     let mut errors = Vec::new();
-
-    for source in feeds {
-        match fetch_feed(source).await {
+    for (name, result) in results {
+        match result {
             Ok(articles) => all.extend(articles),
-            Err(e) => errors.push(format!("{}: {e}", source.name)),
+            Err(e) => errors.push(format!("{name}: {e}")),
         }
     }
 
@@ -395,6 +402,10 @@ fn spawn_feed_fetch(feeds: Vec<FeedSource>, tx: &mpsc::UnboundedSender<AppMessag
         if articles.is_empty() && !errors.is_empty() {
             let _ = tx.send(AppMessage::FeedError(errors.join("; ")));
         } else {
+            if !errors.is_empty() {
+                let failed: Vec<&str> = errors.iter().map(|e| e.split(':').next().unwrap_or("?")).collect();
+                let _ = tx.send(AppMessage::PartialError(format!("Failed: {}", failed.join(", "))));
+            }
             let _ = tx.send(AppMessage::FeedResult(articles));
         }
     });
@@ -1144,6 +1155,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 AppMessage::FeedError(e) => {
                     app.error = Some(e);
                     app.loading = false;
+                }
+                AppMessage::PartialError(msg) => {
+                    app.show_toast(&msg);
                 }
                 AppMessage::ArticleContent { link, content } => {
                     if app.loading_article.as_deref() == Some(&link) {
