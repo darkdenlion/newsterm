@@ -5,10 +5,11 @@ use chrono::{DateTime, FixedOffset, Utc};
 use cli_clipboard::{ClipboardContext, ClipboardProvider};
 use config::{parse_hex_color, Config};
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
+    event::{Event, EventStream, KeyCode, KeyEventKind, KeyModifiers},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
+use futures::StreamExt;
 use html_escape::decode_html_entities;
 use ratatui::{
     layout::{Constraint, Direction, Layout, Margin, Rect},
@@ -1100,7 +1101,7 @@ fn render_footer(f: &mut Frame, app: &App, area: Rect) {
             Span::styled("quit", Style::default().fg(theme::FG_DIM)),
         ],
         View::Detail => vec![
-            Span::styled(" Esc ", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+            Span::styled(" q/Esc ", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
             Span::styled("back  ", Style::default().fg(theme::FG_DIM)),
             Span::styled("↑/↓ ", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
             Span::styled("scroll  ", Style::default().fg(theme::FG_DIM)),
@@ -1111,9 +1112,7 @@ fn render_footer(f: &mut Frame, app: &App, area: Rect) {
             Span::styled("y ", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
             Span::styled("copy  ", Style::default().fg(theme::FG_DIM)),
             Span::styled("b ", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
-            Span::styled("bookmark  ", Style::default().fg(theme::FG_DIM)),
-            Span::styled("q ", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
-            Span::styled("quit", Style::default().fg(theme::FG_DIM)),
+            Span::styled("bookmark", Style::default().fg(theme::FG_DIM)),
         ],
     };
 
@@ -1165,6 +1164,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut auto_refresh_interval = tokio::time::interval(auto_refresh);
     auto_refresh_interval.tick().await;
 
+    let mut event_reader = EventStream::new();
+
     loop {
         terminal.draw(|f| ui(f, &app))?;
 
@@ -1188,7 +1189,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     if app.loading_article.as_deref() == Some(&link) {
                         app.loading_article = None;
                     }
-                    // Store error message so user sees it
                     app.content_cache
                         .insert(link, format!("[Could not load full article: {error}]"));
                 }
@@ -1208,168 +1208,172 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     spawn_feed_fetch(feeds.clone(), &tx);
                 }
             }
-            result = poll_event() => {
-                if let Some((key_code, modifiers)) = result {
-                    let term_height = terminal.size().map(|s| s.height).unwrap_or(24);
-                    let page_size = (term_height / 2) as usize;
+            event = event_reader.next() => {
+                let Some(Ok(Event::Key(key))) = event else { continue };
+                if key.kind != KeyEventKind::Press { continue; }
 
-                    match app.view {
-                        View::List if app.search_active => match key_code {
-                            KeyCode::Esc => app.clear_search(),
-                            KeyCode::Enter => app.search_active = false,
-                            KeyCode::Backspace => {
-                                app.search_query.pop();
-                                app.apply_filter();
-                            }
-                            KeyCode::Char(c) => {
-                                app.search_query.push(c);
-                                app.apply_filter();
-                            }
-                            KeyCode::Down => app.next_article(),
-                            KeyCode::Up => app.prev_article(),
-                            _ => {}
-                        },
-                        View::List => match key_code {
-                            KeyCode::Char('q') => break,
-                            KeyCode::Down | KeyCode::Char('j') => app.next_article(),
-                            KeyCode::Up | KeyCode::Char('k') => app.prev_article(),
-                            KeyCode::Char('d') if modifiers.contains(KeyModifiers::CONTROL) => {
-                                app.page_down(page_size);
-                            }
-                            KeyCode::Char('u') if modifiers.contains(KeyModifiers::CONTROL) => {
-                                app.page_up(page_size);
-                            }
-                            KeyCode::Char('G') => {
-                                let len = app.visible_articles().len();
-                                if len > 0 {
-                                    app.list_state.select(Some(len - 1));
-                                }
-                            }
-                            KeyCode::Char('g') => {
-                                if !app.visible_articles().is_empty() {
-                                    app.list_state.select(Some(0));
-                                }
-                            }
-                            KeyCode::Enter => {
-                                if let Some(article) = app.selected_article() {
-                                    let link = article.link.clone();
-                                    app.store.mark_read(&link);
-                                    app.scroll_offset = 0;
-                                    app.view = View::Detail;
+                let key_code = key.code;
+                let modifiers = key.modifiers;
+                let term_height = terminal.size().map(|s| s.height).unwrap_or(24);
+                let page_size = (term_height / 2) as usize;
 
-                                    // Fetch full article if not cached
-                                    if !link.is_empty() && !app.content_cache.contains_key(&link) {
-                                        app.loading_article = Some(link.clone());
-                                        spawn_article_fetch(link, &tx);
-                                    }
-                                }
+                match app.view {
+                    View::List if app.search_active => match key_code {
+                        KeyCode::Esc => app.clear_search(),
+                        KeyCode::Enter => app.search_active = false,
+                        KeyCode::Backspace => {
+                            app.search_query.pop();
+                            app.apply_filter();
+                        }
+                        KeyCode::Char(c) => {
+                            app.search_query.push(c);
+                            app.apply_filter();
+                        }
+                        KeyCode::Down => app.next_article(),
+                        KeyCode::Up => app.prev_article(),
+                        _ => {}
+                    },
+                    View::List => match key_code {
+                        KeyCode::Char('q') => break,
+                        KeyCode::Down | KeyCode::Char('j') => app.next_article(),
+                        KeyCode::Up | KeyCode::Char('k') => app.prev_article(),
+                        KeyCode::Char('d') if modifiers.contains(KeyModifiers::CONTROL) => {
+                            app.page_down(page_size);
+                        }
+                        KeyCode::Char('u') if modifiers.contains(KeyModifiers::CONTROL) => {
+                            app.page_up(page_size);
+                        }
+                        KeyCode::Char('G') => {
+                            let len = app.visible_articles().len();
+                            if len > 0 {
+                                app.list_state.select(Some(len - 1));
                             }
-                            KeyCode::Char('/') => {
-                                app.search_active = true;
-                                app.search_query.clear();
+                        }
+                        KeyCode::Char('g') => {
+                            if !app.visible_articles().is_empty() {
+                                app.list_state.select(Some(0));
                             }
-                            KeyCode::Char('b') => {
-                                if let Some(article) = app.selected_article() {
-                                    let (title, link, source) = (
-                                        article.title.clone(),
-                                        article.link.clone(),
-                                        article.source.clone(),
-                                    );
-                                    let added = app.store.toggle_bookmark(&title, &link, &source);
-                                    if added {
-                                        app.show_toast("★ Bookmarked");
-                                    } else {
-                                        app.show_toast("Bookmark removed");
-                                    }
-                                }
-                            }
-                            KeyCode::Char('r') => {
-                                if !app.loading {
-                                    app.loading = true;
-                                    app.error = None;
-                                    spawn_feed_fetch(feeds.clone(), &tx);
-                                    auto_refresh_interval.reset();
-                                }
-                            }
-                            _ => {}
-                        },
-                        View::Detail => match key_code {
-                            KeyCode::Char('q') => break,
-                            KeyCode::Esc | KeyCode::Backspace => {
-                                app.view = View::List;
-                            }
-                            KeyCode::Down | KeyCode::Char('j') => {
-                                app.scroll_offset = app.scroll_offset.saturating_add(1);
-                            }
-                            KeyCode::Up | KeyCode::Char('k') => {
-                                app.scroll_offset = app.scroll_offset.saturating_sub(1);
-                            }
-                            KeyCode::Char('d') if modifiers.contains(KeyModifiers::CONTROL) => {
-                                app.scroll_offset = app.scroll_offset.saturating_add(page_size as u16);
-                            }
-                            KeyCode::Char('u') if modifiers.contains(KeyModifiers::CONTROL) => {
-                                app.scroll_offset = app.scroll_offset.saturating_sub(page_size as u16);
-                            }
-                            KeyCode::Char('n') | KeyCode::Right => {
-                                app.next_article();
+                        }
+                        KeyCode::Enter => {
+                            if let Some(article) = app.selected_article() {
+                                let link = article.link.clone();
+                                app.store.mark_read(&link);
                                 app.scroll_offset = 0;
-                                if let Some(article) = app.selected_article() {
-                                    let link = article.link.clone();
-                                    app.store.mark_read(&link);
-                                    if !link.is_empty() && !app.content_cache.contains_key(&link) {
-                                        app.loading_article = Some(link.clone());
-                                        spawn_article_fetch(link, &tx);
-                                    }
+                                app.view = View::Detail;
+
+                                if !link.is_empty() && !app.content_cache.contains_key(&link) {
+                                    app.loading_article = Some(link.clone());
+                                    spawn_article_fetch(link, &tx);
                                 }
                             }
-                            KeyCode::Char('N') | KeyCode::Left => {
-                                app.prev_article();
-                                app.scroll_offset = 0;
-                                if let Some(article) = app.selected_article() {
-                                    let link = article.link.clone();
-                                    app.store.mark_read(&link);
-                                    if !link.is_empty() && !app.content_cache.contains_key(&link) {
-                                        app.loading_article = Some(link.clone());
-                                        spawn_article_fetch(link, &tx);
-                                    }
+                        }
+                        KeyCode::Char('/') => {
+                            app.search_active = true;
+                            app.search_query.clear();
+                        }
+                        KeyCode::Char('b') => {
+                            if let Some(article) = app.selected_article() {
+                                let (title, link, source) = (
+                                    article.title.clone(),
+                                    article.link.clone(),
+                                    article.source.clone(),
+                                );
+                                let added = app.store.toggle_bookmark(&title, &link, &source);
+                                if added {
+                                    app.show_toast("★ Bookmarked");
+                                } else {
+                                    app.show_toast("Bookmark removed");
                                 }
                             }
-                            KeyCode::Char('o') => {
-                                if let Some(article) = app.selected_article() {
-                                    if !article.link.is_empty() {
-                                        let _ = open::that(&article.link);
-                                    }
+                        }
+                        KeyCode::Char('r') => {
+                            if !app.loading {
+                                app.loading = true;
+                                app.error = None;
+                                spawn_feed_fetch(feeds.clone(), &tx);
+                                auto_refresh_interval.reset();
+                            }
+                        }
+                        _ => {}
+                    },
+                    View::Detail => match key_code {
+                        KeyCode::Char('q') => {
+                            app.view = View::List;
+                        }
+                        KeyCode::Esc | KeyCode::Backspace => {
+                            app.view = View::List;
+                        }
+                        KeyCode::Down | KeyCode::Char('j') => {
+                            app.scroll_offset = app.scroll_offset.saturating_add(1);
+                        }
+                        KeyCode::Up | KeyCode::Char('k') => {
+                            app.scroll_offset = app.scroll_offset.saturating_sub(1);
+                        }
+                        KeyCode::Char('d') if modifiers.contains(KeyModifiers::CONTROL) => {
+                            app.scroll_offset = app.scroll_offset.saturating_add(page_size as u16);
+                        }
+                        KeyCode::Char('u') if modifiers.contains(KeyModifiers::CONTROL) => {
+                            app.scroll_offset = app.scroll_offset.saturating_sub(page_size as u16);
+                        }
+                        KeyCode::Char('n') | KeyCode::Right => {
+                            app.next_article();
+                            app.scroll_offset = 0;
+                            if let Some(article) = app.selected_article() {
+                                let link = article.link.clone();
+                                app.store.mark_read(&link);
+                                if !link.is_empty() && !app.content_cache.contains_key(&link) {
+                                    app.loading_article = Some(link.clone());
+                                    spawn_article_fetch(link, &tx);
                                 }
                             }
-                            KeyCode::Char('y') => {
-                                if let Some(article) = app.selected_article() {
-                                    if !article.link.is_empty() {
-                                        if let Ok(mut ctx) = ClipboardContext::new() {
-                                            if ctx.set_contents(article.link.clone()).is_ok() {
-                                                app.show_toast("Link copied!");
-                                            }
+                        }
+                        KeyCode::Char('N') | KeyCode::Left => {
+                            app.prev_article();
+                            app.scroll_offset = 0;
+                            if let Some(article) = app.selected_article() {
+                                let link = article.link.clone();
+                                app.store.mark_read(&link);
+                                if !link.is_empty() && !app.content_cache.contains_key(&link) {
+                                    app.loading_article = Some(link.clone());
+                                    spawn_article_fetch(link, &tx);
+                                }
+                            }
+                        }
+                        KeyCode::Char('o') => {
+                            if let Some(article) = app.selected_article() {
+                                if !article.link.is_empty() {
+                                    let _ = open::that(&article.link);
+                                }
+                            }
+                        }
+                        KeyCode::Char('y') => {
+                            if let Some(article) = app.selected_article() {
+                                if !article.link.is_empty() {
+                                    if let Ok(mut ctx) = ClipboardContext::new() {
+                                        if ctx.set_contents(article.link.clone()).is_ok() {
+                                            app.show_toast("Link copied!");
                                         }
                                     }
                                 }
                             }
-                            KeyCode::Char('b') => {
-                                if let Some(article) = app.selected_article() {
-                                    let (title, link, source) = (
-                                        article.title.clone(),
-                                        article.link.clone(),
-                                        article.source.clone(),
-                                    );
-                                    let added = app.store.toggle_bookmark(&title, &link, &source);
-                                    if added {
-                                        app.show_toast("★ Bookmarked");
-                                    } else {
-                                        app.show_toast("Bookmark removed");
-                                    }
+                        }
+                        KeyCode::Char('b') => {
+                            if let Some(article) = app.selected_article() {
+                                let (title, link, source) = (
+                                    article.title.clone(),
+                                    article.link.clone(),
+                                    article.source.clone(),
+                                );
+                                let added = app.store.toggle_bookmark(&title, &link, &source);
+                                if added {
+                                    app.show_toast("★ Bookmarked");
+                                } else {
+                                    app.show_toast("Bookmark removed");
                                 }
                             }
-                            _ => {}
-                        },
-                    }
+                        }
+                        _ => {}
+                    },
                 }
             }
         }
@@ -1380,19 +1384,4 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     terminal.show_cursor()?;
 
     Ok(())
-}
-
-async fn poll_event() -> Option<(KeyCode, KeyModifiers)> {
-    tokio::task::spawn_blocking(|| {
-        if event::poll(std::time::Duration::from_millis(50)).ok()? {
-            if let Event::Key(key) = event::read().ok()? {
-                if key.kind == KeyEventKind::Press {
-                    return Some((key.code, key.modifiers));
-                }
-            }
-        }
-        None
-    })
-    .await
-    .ok()?
 }
