@@ -1,9 +1,11 @@
 mod config;
+mod store;
 
 use chrono::{DateTime, FixedOffset, Utc};
+use cli_clipboard::{ClipboardContext, ClipboardProvider};
 use config::{parse_hex_color, Config};
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEventKind},
+    event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -17,6 +19,7 @@ use ratatui::{
 };
 use rss::Channel;
 use std::io;
+use store::Store;
 use textwrap::wrap;
 use tokio::sync::mpsc;
 
@@ -28,12 +31,15 @@ mod theme {
     pub const FG: Color = Color::Rgb(200, 200, 200);
     pub const FG_DIM: Color = Color::Rgb(100, 100, 110);
     pub const FG_MUTED: Color = Color::Rgb(140, 140, 150);
+    pub const FG_READ: Color = Color::Rgb(80, 80, 90);
     pub const HIGHLIGHT_BG: Color = Color::Rgb(35, 35, 50);
     pub const BORDER: Color = Color::Rgb(50, 50, 65);
     pub const BREAKING_BG: Color = Color::Rgb(40, 20, 20);
     pub const BREAKING_ACCENT: Color = Color::Rgb(255, 80, 80);
     pub const FOOTER_BG: Color = Color::Rgb(25, 25, 35);
     pub const SPINNER: Color = Color::Rgb(120, 120, 200);
+    pub const BOOKMARK: Color = Color::Rgb(255, 200, 50);
+    pub const SUCCESS: Color = Color::Rgb(80, 200, 80);
 }
 
 // ── Feed sources ──────────────────────────────────────────────────────────────
@@ -125,6 +131,8 @@ struct App {
     spinner_tick: usize,
     search_active: bool,
     search_query: String,
+    store: Store,
+    toast: Option<(String, std::time::Instant)>,
 }
 
 impl App {
@@ -144,6 +152,8 @@ impl App {
             spinner_tick: 0,
             search_active: false,
             search_query: String::new(),
+            store: Store::load(),
+            toast: None,
         }
     }
 
@@ -180,6 +190,30 @@ impl App {
         }
         let i = match self.list_state.selected() {
             Some(i) => i.saturating_sub(1),
+            None => 0,
+        };
+        self.list_state.select(Some(i));
+    }
+
+    fn page_down(&mut self, page_size: usize) {
+        let len = self.visible_articles().len();
+        if len == 0 {
+            return;
+        }
+        let i = match self.list_state.selected() {
+            Some(i) => (i + page_size).min(len - 1),
+            None => 0,
+        };
+        self.list_state.select(Some(i));
+    }
+
+    fn page_up(&mut self, page_size: usize) {
+        let len = self.visible_articles().len();
+        if len == 0 {
+            return;
+        }
+        let i = match self.list_state.selected() {
+            Some(i) => i.saturating_sub(page_size),
             None => 0,
         };
         self.list_state.select(Some(i));
@@ -236,6 +270,19 @@ impl App {
 
     fn spinner(&self) -> &'static str {
         SPINNER_FRAMES[self.spinner_tick]
+    }
+
+    fn show_toast(&mut self, msg: &str) {
+        self.toast = Some((msg.to_string(), std::time::Instant::now()));
+    }
+
+    fn active_toast(&self) -> Option<&str> {
+        if let Some((msg, time)) = &self.toast {
+            if time.elapsed() < std::time::Duration::from_secs(2) {
+                return Some(msg.as_str());
+            }
+        }
+        None
     }
 }
 
@@ -322,7 +369,7 @@ fn spawn_fetch(feeds: Vec<FeedSource>, tx: &mpsc::UnboundedSender<FetchResult>) 
 // ── UI rendering ──────────────────────────────────────────────────────────────
 
 fn ui(f: &mut Frame, app: &App) {
-    let breaking_height = if app.breaking.is_empty() {
+    let breaking_height = if app.breaking.is_empty() || app.view == View::Detail {
         0
     } else {
         (app.breaking.len() as u16) + 3
@@ -362,7 +409,13 @@ fn ui(f: &mut Frame, app: &App) {
                 render_list(f, app, outer[2]);
             }
             View::Detail => {
-                render_detail(f, app, outer[1], outer[2]);
+                let full = Rect {
+                    x: outer[1].x,
+                    y: outer[1].y,
+                    width: outer[1].width,
+                    height: outer[1].height + outer[2].height,
+                };
+                render_detail(f, app, full);
             }
         }
     }
@@ -386,6 +439,19 @@ fn render_header(f: &mut Frame, app: &App, area: Rect) {
             }
         }
         (false, None) => String::new(),
+    };
+
+    // Toast overrides the right side
+    let right_str = if let Some(toast) = app.active_toast() {
+        toast.to_string()
+    } else {
+        updated_text
+    };
+
+    let right_color = if app.active_toast().is_some() {
+        theme::SUCCESS
+    } else {
+        theme::FG_DIM
     };
 
     let mut title_spans = vec![
@@ -413,13 +479,13 @@ fn render_header(f: &mut Frame, app: &App, area: Rect) {
     let title_line = Line::from(title_spans);
 
     let right_text = Line::from(Span::styled(
-        format!("{updated_text} "),
-        Style::default().fg(theme::FG_DIM),
+        format!("{right_str} "),
+        Style::default().fg(right_color),
     ));
 
     let header_layout = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Min(0), Constraint::Length(updated_text.len() as u16 + 2)])
+        .constraints([Constraint::Min(0), Constraint::Length(right_str.len() as u16 + 2)])
         .split(area);
 
     let left = Paragraph::new(title_line).block(
@@ -483,10 +549,12 @@ fn render_breaking(f: &mut Frame, app: &App, area: Rect) {
 
     for (i, article) in app.breaking.iter().enumerate() {
         let age = article.age_label();
+        let bookmark_icon = if app.store.is_bookmarked(&article.link) { "★ " } else { "" };
         let line = Line::from(vec![
             Span::styled("  ", Style::default()),
             source_badge(&article.source, article.source_color),
             Span::styled(" ", Style::default()),
+            Span::styled(bookmark_icon, Style::default().fg(theme::BOOKMARK)),
             Span::styled(
                 &article.title,
                 Style::default()
@@ -583,14 +651,23 @@ fn render_list(f: &mut Frame, app: &App, area: Rect) {
         .iter()
         .map(|article| {
             let age = article.age_label();
+            let is_read = app.store.is_read(&article.link);
+            let is_bookmarked = app.store.is_bookmarked(&article.link);
+
+            let title_style = if is_read {
+                Style::default().fg(theme::FG_READ)
+            } else {
+                Style::default().fg(theme::FG)
+            };
+
+            let bookmark_icon = if is_bookmarked { "★ " } else { "" };
+
             let line = Line::from(vec![
                 Span::styled(" ", Style::default()),
                 source_badge(&article.source, article.source_color),
                 Span::styled("  ", Style::default()),
-                Span::styled(
-                    &article.title,
-                    Style::default().fg(theme::FG),
-                ),
+                Span::styled(bookmark_icon, Style::default().fg(theme::BOOKMARK)),
+                Span::styled(&article.title, title_style),
                 Span::styled(
                     format!("  {age}"),
                     Style::default().fg(theme::FG_DIM),
@@ -612,22 +689,15 @@ fn render_list(f: &mut Frame, app: &App, area: Rect) {
     f.render_stateful_widget(list, layout[2], &mut app.list_state.clone());
 }
 
-fn render_detail(f: &mut Frame, app: &App, breaking_area: Rect, list_area: Rect) {
+fn render_detail(f: &mut Frame, app: &App, area: Rect) {
     let article = match app.selected_article() {
         Some(a) => a,
         None => return,
     };
 
-    let full = Rect {
-        x: breaking_area.x,
-        y: breaking_area.y,
-        width: breaking_area.width,
-        height: breaking_area.height + list_area.height,
-    };
+    f.render_widget(Clear, area);
 
-    f.render_widget(Clear, full);
-
-    let inner = full.inner(Margin {
+    let inner = area.inner(Margin {
         vertical: 1,
         horizontal: 4,
     });
@@ -635,12 +705,20 @@ fn render_detail(f: &mut Frame, app: &App, breaking_area: Rect, list_area: Rect)
     let content_width = inner.width.saturating_sub(2) as usize;
     let mut lines: Vec<Line> = Vec::new();
 
+    // Source badge + bookmark + age
+    let bookmark_span = if app.store.is_bookmarked(&article.link) {
+        Span::styled(" ★ bookmarked", Style::default().fg(theme::BOOKMARK))
+    } else {
+        Span::styled("", Style::default())
+    };
+
     lines.push(Line::from(vec![
         source_badge(&article.source, article.source_color),
         Span::styled(
             format!("  {}", article.age_label()),
             Style::default().fg(theme::FG_DIM),
         ),
+        bookmark_span,
     ]));
     lines.push(Line::default());
 
@@ -714,17 +792,19 @@ fn render_footer(f: &mut Frame, app: &App, area: Rect) {
             Span::styled(" Type ", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
             Span::styled("to filter  ", Style::default().fg(theme::FG_DIM)),
             Span::styled("Esc ", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
-            Span::styled("clear search  ", Style::default().fg(theme::FG_DIM)),
+            Span::styled("clear  ", Style::default().fg(theme::FG_DIM)),
             Span::styled("Enter ", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
             Span::styled("done", Style::default().fg(theme::FG_DIM)),
         ],
         View::List => vec![
             Span::styled(" ↑/↓ j/k ", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
-            Span::styled("navigate  ", Style::default().fg(theme::FG_DIM)),
+            Span::styled("nav  ", Style::default().fg(theme::FG_DIM)),
             Span::styled("Enter ", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
             Span::styled("read  ", Style::default().fg(theme::FG_DIM)),
             Span::styled("/ ", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
             Span::styled("search  ", Style::default().fg(theme::FG_DIM)),
+            Span::styled("b ", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+            Span::styled("bookmark  ", Style::default().fg(theme::FG_DIM)),
             Span::styled("r ", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
             Span::styled("refresh  ", Style::default().fg(theme::FG_DIM)),
             Span::styled("q ", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
@@ -736,7 +816,11 @@ fn render_footer(f: &mut Frame, app: &App, area: Rect) {
             Span::styled("↑/↓ j/k ", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
             Span::styled("scroll  ", Style::default().fg(theme::FG_DIM)),
             Span::styled("o ", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
-            Span::styled("open in browser  ", Style::default().fg(theme::FG_DIM)),
+            Span::styled("open  ", Style::default().fg(theme::FG_DIM)),
+            Span::styled("y ", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+            Span::styled("copy link  ", Style::default().fg(theme::FG_DIM)),
+            Span::styled("b ", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+            Span::styled("bookmark  ", Style::default().fg(theme::FG_DIM)),
             Span::styled("q ", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
             Span::styled("quit", Style::default().fg(theme::FG_DIM)),
         ],
@@ -784,12 +868,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let (tx, mut rx) = mpsc::unbounded_channel::<FetchResult>();
 
-    // Initial fetch
     spawn_fetch(feeds.clone(), &tx);
 
     let mut spinner_interval = tokio::time::interval(std::time::Duration::from_millis(80));
     let mut auto_refresh_interval = tokio::time::interval(auto_refresh);
-    // Skip the first immediate tick (we already spawned initial fetch)
     auto_refresh_interval.tick().await;
 
     loop {
@@ -819,15 +901,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
             result = poll_event() => {
-                if let Some(key_code) = result {
+                if let Some((key_code, modifiers)) = result {
+                    // Ctrl+d / Ctrl+u for page down/up in both views
+                    let page_size = 10;
+
                     match app.view {
                         View::List if app.search_active => match key_code {
-                            KeyCode::Esc => {
-                                app.clear_search();
-                            }
-                            KeyCode::Enter => {
-                                app.search_active = false;
-                            }
+                            KeyCode::Esc => app.clear_search(),
+                            KeyCode::Enter => app.search_active = false,
                             KeyCode::Backspace => {
                                 app.search_query.pop();
                                 app.apply_filter();
@@ -844,8 +925,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             KeyCode::Char('q') => break,
                             KeyCode::Down | KeyCode::Char('j') => app.next_article(),
                             KeyCode::Up | KeyCode::Char('k') => app.prev_article(),
+                            KeyCode::Char('d') if modifiers.contains(KeyModifiers::CONTROL) => {
+                                app.page_down(page_size);
+                            }
+                            KeyCode::Char('u') if modifiers.contains(KeyModifiers::CONTROL) => {
+                                app.page_up(page_size);
+                            }
+                            KeyCode::Char('G') => {
+                                // Go to bottom
+                                let len = app.visible_articles().len();
+                                if len > 0 {
+                                    app.list_state.select(Some(len - 1));
+                                }
+                            }
+                            KeyCode::Char('g') => {
+                                // Go to top
+                                if !app.visible_articles().is_empty() {
+                                    app.list_state.select(Some(0));
+                                }
+                            }
                             KeyCode::Enter => {
-                                if app.selected_article().is_some() {
+                                if let Some(article) = app.selected_article() {
+                                    let link = article.link.clone();
+                                    app.store.mark_read(&link);
                                     app.scroll_offset = 0;
                                     app.view = View::Detail;
                                 }
@@ -853,6 +955,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             KeyCode::Char('/') => {
                                 app.search_active = true;
                                 app.search_query.clear();
+                            }
+                            KeyCode::Char('b') => {
+                                if let Some(article) = app.selected_article() {
+                                    let (title, link, source) = (
+                                        article.title.clone(),
+                                        article.link.clone(),
+                                        article.source.clone(),
+                                    );
+                                    let added = app.store.toggle_bookmark(&title, &link, &source);
+                                    if added {
+                                        app.show_toast("★ Bookmarked");
+                                    } else {
+                                        app.show_toast("Bookmark removed");
+                                    }
+                                }
                             }
                             KeyCode::Char('r') => {
                                 if !app.loading {
@@ -875,10 +992,42 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             KeyCode::Up | KeyCode::Char('k') => {
                                 app.scroll_offset = app.scroll_offset.saturating_sub(1);
                             }
+                            KeyCode::Char('d') if modifiers.contains(KeyModifiers::CONTROL) => {
+                                app.scroll_offset = app.scroll_offset.saturating_add(page_size as u16);
+                            }
+                            KeyCode::Char('u') if modifiers.contains(KeyModifiers::CONTROL) => {
+                                app.scroll_offset = app.scroll_offset.saturating_sub(page_size as u16);
+                            }
                             KeyCode::Char('o') => {
                                 if let Some(article) = app.selected_article() {
                                     if !article.link.is_empty() {
                                         let _ = open::that(&article.link);
+                                    }
+                                }
+                            }
+                            KeyCode::Char('y') => {
+                                if let Some(article) = app.selected_article() {
+                                    if !article.link.is_empty() {
+                                        if let Ok(mut ctx) = ClipboardContext::new() {
+                                            if ctx.set_contents(article.link.clone()).is_ok() {
+                                                app.show_toast("Link copied!");
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            KeyCode::Char('b') => {
+                                if let Some(article) = app.selected_article() {
+                                    let (title, link, source) = (
+                                        article.title.clone(),
+                                        article.link.clone(),
+                                        article.source.clone(),
+                                    );
+                                    let added = app.store.toggle_bookmark(&title, &link, &source);
+                                    if added {
+                                        app.show_toast("★ Bookmarked");
+                                    } else {
+                                        app.show_toast("Bookmark removed");
                                     }
                                 }
                             }
@@ -897,12 +1046,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-async fn poll_event() -> Option<KeyCode> {
+async fn poll_event() -> Option<(KeyCode, KeyModifiers)> {
     tokio::task::spawn_blocking(|| {
         if event::poll(std::time::Duration::from_millis(50)).ok()? {
             if let Event::Key(key) = event::read().ok()? {
                 if key.kind == KeyEventKind::Press {
-                    return Some(key.code);
+                    return Some((key.code, key.modifiers));
                 }
             }
         }
