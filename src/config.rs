@@ -38,32 +38,32 @@ fn default_feeds() -> Vec<FeedConfig> {
         FeedConfig {
             name: "CNN".into(),
             url: "http://rss.cnn.com/rss/edition.rss".into(),
-            color: "#8b2020".into(),
+            color: "#5a1515".into(),
         },
         FeedConfig {
             name: "CNBC".into(),
             url: "https://search.cnbc.com/rs/search/combinedcms/view.xml?partnerId=wrss01&id=100003114".into(),
-            color: "#1a6a8a".into(),
+            color: "#104858".into(),
         },
         FeedConfig {
             name: "BBC".into(),
             url: "https://feeds.bbci.co.uk/news/rss.xml".into(),
-            color: "#7a1515".into(),
+            color: "#4e1010".into(),
         },
         FeedConfig {
-            name: "Reuters".into(),
-            url: "https://www.reutersagency.com/feed/".into(),
-            color: "#a05a10".into(),
+            name: "NYT".into(),
+            url: "https://rss.nytimes.com/services/xml/rss/nyt/HomePage.xml".into(),
+            color: "#6b3a0a".into(),
         },
         FeedConfig {
             name: "TechCrunch".into(),
             url: "https://techcrunch.com/feed/".into(),
-            color: "#1a7a1a".into(),
+            color: "#105010".into(),
         },
         FeedConfig {
-            name: "AP News".into(),
-            url: "https://rsshub.app/apnews/topics/apf-topnews".into(),
-            color: "#8b2a2d".into(),
+            name: "NPR".into(),
+            url: "https://feeds.npr.org/1001/rss.xml".into(),
+            color: "#5a1a1c".into(),
         },
     ]
 }
