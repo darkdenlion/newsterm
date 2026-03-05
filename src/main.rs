@@ -142,6 +142,8 @@ struct App {
     content_cache: HashMap<String, String>,
     // Currently loading article content for this link
     loading_article: Option<String>,
+    // Breaking news ticker scroll offset
+    ticker_offset: usize,
 }
 
 impl App {
@@ -165,6 +167,7 @@ impl App {
             toast: None,
             content_cache: HashMap::new(),
             loading_article: None,
+            ticker_offset: 0,
         }
     }
 
@@ -277,6 +280,10 @@ impl App {
 
     fn tick_spinner(&mut self) {
         self.spinner_tick = (self.spinner_tick + 1) % SPINNER_FRAMES.len();
+    }
+
+    fn tick_ticker(&mut self) {
+        self.ticker_offset += 1;
     }
 
     fn spinner(&self) -> &'static str {
@@ -468,7 +475,7 @@ fn ui(f: &mut Frame, app: &App) {
     let breaking_height = if app.breaking.is_empty() || app.view == View::Detail {
         0
     } else {
-        (app.breaking.len() as u16) + 3
+        1
     };
 
     let outer = Layout::default()
@@ -618,67 +625,56 @@ fn render_breaking(f: &mut Frame, app: &App, area: Rect) {
         return;
     }
 
-    let block = Block::default()
-        .borders(Borders::BOTTOM)
-        .border_style(Style::default().fg(theme::BORDER))
-        .padding(Padding::new(1, 1, 0, 0));
+    // Build the full ticker string: " ▲ BREAKING │ Title1 (source) ··· Title2 (source) ··· "
+    let separator = "  ◆  ";
+    let mut ticker_text = String::new();
+    for (i, article) in app.breaking.iter().enumerate() {
+        if i > 0 {
+            ticker_text.push_str(separator);
+        }
+        ticker_text.push_str(&article.title);
+        ticker_text.push_str(&format!(" ({})", article.source));
+    }
 
-    let inner = block.inner(area);
-    f.render_widget(block, area);
+    let label = " ▲ BREAKING ";
+    let label_len = label.len();
+    let ticker_area_width = (area.width as usize).saturating_sub(label_len);
 
-    let rows = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints(
-            std::iter::once(Constraint::Length(1))
-                .chain(app.breaking.iter().map(|_| Constraint::Length(1)))
-                .collect::<Vec<_>>(),
-        )
-        .split(inner);
+    if ticker_area_width == 0 {
+        return;
+    }
 
-    let title = Line::from(vec![
+    // Double the text so it loops seamlessly
+    let full_ticker = format!("{ticker_text}{separator}{ticker_text}{separator}");
+    let ticker_chars: Vec<char> = full_ticker.chars().collect();
+    let total_len = ticker_chars.len();
+
+    // Get the visible slice based on offset
+    let offset = app.ticker_offset % total_len.max(1);
+    let visible: String = ticker_chars
+        .iter()
+        .cycle()
+        .skip(offset)
+        .take(ticker_area_width)
+        .collect();
+
+    let line = Line::from(vec![
         Span::styled(
-            " ▲ ",
+            label,
             Style::default()
                 .fg(Color::White)
                 .bg(theme::BREAKING_ACCENT)
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled(
-            " BREAKING",
+            format!(" {visible}"),
             Style::default()
-                .fg(theme::BREAKING_ACCENT)
-                .add_modifier(Modifier::BOLD),
+                .fg(Color::White)
+                .bg(theme::BREAKING_BG),
         ),
     ]);
-    f.render_widget(Paragraph::new(title), rows[0]);
 
-    for (i, article) in app.breaking.iter().enumerate() {
-        let age = article.age_label();
-        let bookmark_icon = if app.store.is_bookmarked(&article.link) { "★ " } else { "" };
-        let line = Line::from(vec![
-            Span::styled("  ", Style::default()),
-            source_badge(&article.source, article.source_color),
-            Span::styled(" ", Style::default()),
-            Span::styled(bookmark_icon, Style::default().fg(theme::BOOKMARK)),
-            Span::styled(
-                &article.title,
-                Style::default()
-                    .fg(Color::White)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                format!("  {age}"),
-                Style::default().fg(theme::FG_DIM),
-            ),
-        ]);
-        let bg = if i % 2 == 0 {
-            theme::BREAKING_BG
-        } else {
-            Color::Reset
-        };
-        let p = Paragraph::new(line).style(Style::default().bg(bg));
-        f.render_widget(p, rows[i + 1]);
-    }
+    f.render_widget(Paragraph::new(line), area);
 }
 
 fn render_list(f: &mut Frame, app: &App, area: Rect) {
@@ -1186,6 +1182,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     spawn_feed_fetch(feeds.clone(), &tx);
 
     let mut spinner_interval = tokio::time::interval(std::time::Duration::from_millis(80));
+    let mut ticker_interval = tokio::time::interval(std::time::Duration::from_millis(200));
     let mut auto_refresh_interval = tokio::time::interval(auto_refresh);
     auto_refresh_interval.tick().await;
 
@@ -1224,6 +1221,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             _ = spinner_interval.tick() => {
                 if app.loading || app.loading_article.is_some() {
                     app.tick_spinner();
+                }
+            }
+            _ = ticker_interval.tick() => {
+                if !app.breaking.is_empty() {
+                    app.tick_ticker();
                 }
             }
             _ = auto_refresh_interval.tick() => {
