@@ -406,7 +406,17 @@ fn ui(f: &mut Frame, app: &App) {
         match app.view {
             View::List => {
                 render_breaking(f, app, outer[1]);
-                render_list(f, app, outer[2]);
+                let wide = outer[2].width >= 100;
+                if wide {
+                    let panes = Layout::default()
+                        .direction(Direction::Horizontal)
+                        .constraints([Constraint::Percentage(45), Constraint::Percentage(55)])
+                        .split(outer[2]);
+                    render_list(f, app, panes[0]);
+                    render_preview(f, app, panes[1]);
+                } else {
+                    render_list(f, app, outer[2]);
+                }
             }
             View::Detail => {
                 let full = Rect {
@@ -687,6 +697,96 @@ fn render_list(f: &mut Frame, app: &App, area: Rect) {
         .highlight_symbol(" ▌");
 
     f.render_stateful_widget(list, layout[2], &mut app.list_state.clone());
+}
+
+fn render_preview(f: &mut Frame, app: &App, area: Rect) {
+    let article = match app.selected_article() {
+        Some(a) => a,
+        None => {
+            let empty = Paragraph::new("  Select an article to preview")
+                .style(Style::default().fg(theme::FG_DIM))
+                .block(
+                    Block::default()
+                        .borders(Borders::LEFT)
+                        .border_style(Style::default().fg(theme::BORDER))
+                        .padding(Padding::new(1, 1, 1, 0)),
+                );
+            f.render_widget(empty, area);
+            return;
+        }
+    };
+
+    let inner_block = Block::default()
+        .borders(Borders::LEFT)
+        .border_style(Style::default().fg(theme::BORDER))
+        .padding(Padding::new(2, 2, 1, 0));
+    let inner = inner_block.inner(area);
+    f.render_widget(inner_block, area);
+
+    let content_width = inner.width as usize;
+    if content_width == 0 {
+        return;
+    }
+
+    let mut lines: Vec<Line> = Vec::new();
+
+    // Source + age
+    let bookmark_span = if app.store.is_bookmarked(&article.link) {
+        Span::styled(" ★", Style::default().fg(theme::BOOKMARK))
+    } else {
+        Span::styled("", Style::default())
+    };
+
+    lines.push(Line::from(vec![
+        source_badge(&article.source, article.source_color),
+        Span::styled(
+            format!("  {}", article.age_label()),
+            Style::default().fg(theme::FG_DIM),
+        ),
+        bookmark_span,
+    ]));
+    lines.push(Line::default());
+
+    // Title
+    let title_wrapped = wrap(&article.title, content_width);
+    for l in &title_wrapped {
+        lines.push(Line::from(Span::styled(
+            l.to_string(),
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        )));
+    }
+    lines.push(Line::default());
+
+    // Date
+    if !article.pub_date.is_empty() {
+        lines.push(Line::from(Span::styled(
+            &article.pub_date,
+            Style::default().fg(theme::FG_DIM),
+        )));
+        lines.push(Line::default());
+    }
+
+    // Separator
+    lines.push(Line::from(Span::styled(
+        "─".repeat(content_width.min(50)),
+        Style::default().fg(theme::BORDER),
+    )));
+    lines.push(Line::default());
+
+    // Description
+    let wrap_width = content_width.min(70);
+    let desc_wrapped = wrap(&article.description, wrap_width);
+    for l in &desc_wrapped {
+        lines.push(Line::from(Span::styled(
+            l.to_string(),
+            Style::default().fg(theme::FG),
+        )));
+    }
+
+    let paragraph = Paragraph::new(Text::from(lines));
+    f.render_widget(paragraph, inner);
 }
 
 fn render_detail(f: &mut Frame, app: &App, area: Rect) {
