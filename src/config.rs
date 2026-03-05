@@ -45,6 +45,26 @@ fn default_feeds() -> Vec<FeedConfig> {
             url: "https://search.cnbc.com/rs/search/combinedcms/view.xml?partnerId=wrss01&id=100003114".into(),
             color: "#0088cc".into(),
         },
+        FeedConfig {
+            name: "BBC".into(),
+            url: "https://feeds.bbci.co.uk/news/rss.xml".into(),
+            color: "#bb1919".into(),
+        },
+        FeedConfig {
+            name: "Reuters".into(),
+            url: "https://www.reutersagency.com/feed/".into(),
+            color: "#ff8000".into(),
+        },
+        FeedConfig {
+            name: "TechCrunch".into(),
+            url: "https://techcrunch.com/feed/".into(),
+            color: "#0a9e01".into(),
+        },
+        FeedConfig {
+            name: "AP News".into(),
+            url: "https://rsshub.app/apnews/topics/apf-topnews".into(),
+            color: "#ef3e42".into(),
+        },
     ]
 }
 

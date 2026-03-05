@@ -243,15 +243,20 @@ impl App {
 
 async fn fetch_all_feeds(feeds: &[FeedSource]) -> FetchResult {
     let mut all = Vec::new();
+    let mut errors = Vec::new();
 
     for source in feeds {
         match fetch_feed(source).await {
             Ok(articles) => all.extend(articles),
-            Err(e) => return FetchResult::Error(format!("{}: {e}", source.name)),
+            Err(e) => errors.push(format!("{}: {e}", source.name)),
         }
     }
 
-    FetchResult::Success(all)
+    if all.is_empty() && !errors.is_empty() {
+        FetchResult::Error(errors.join("; "))
+    } else {
+        FetchResult::Success(all)
+    }
 }
 
 async fn fetch_feed(source: &FeedSource) -> Result<Vec<Article>, String> {
