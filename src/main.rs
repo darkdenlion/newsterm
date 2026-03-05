@@ -114,7 +114,8 @@ struct App {
     feeds: Vec<FeedSource>,
     breaking_count: usize,
     breaking: Vec<Article>,
-    articles: Vec<Article>,
+    all_articles: Vec<Article>,
+    filtered_articles: Vec<Article>,
     list_state: ListState,
     view: View,
     scroll_offset: u16,
@@ -122,6 +123,8 @@ struct App {
     error: Option<String>,
     last_updated: Option<DateTime<Utc>>,
     spinner_tick: usize,
+    search_active: bool,
+    search_query: String,
 }
 
 impl App {
@@ -130,7 +133,8 @@ impl App {
             feeds,
             breaking_count,
             breaking: Vec::new(),
-            articles: Vec::new(),
+            all_articles: Vec::new(),
+            filtered_articles: Vec::new(),
             list_state: ListState::default(),
             view: View::List,
             scroll_offset: 0,
@@ -138,26 +142,40 @@ impl App {
             error: None,
             last_updated: None,
             spinner_tick: 0,
+            search_active: false,
+            search_query: String::new(),
+        }
+    }
+
+    fn visible_articles(&self) -> &[Article] {
+        if self.search_query.is_empty() {
+            &self.all_articles
+        } else {
+            &self.filtered_articles
         }
     }
 
     fn selected_article(&self) -> Option<&Article> {
-        self.list_state.selected().and_then(|i| self.articles.get(i))
+        self.list_state
+            .selected()
+            .and_then(|i| self.visible_articles().get(i))
     }
 
     fn next_article(&mut self) {
-        if self.articles.is_empty() {
+        let len = self.visible_articles().len();
+        if len == 0 {
             return;
         }
         let i = match self.list_state.selected() {
-            Some(i) => (i + 1).min(self.articles.len() - 1),
+            Some(i) => (i + 1).min(len - 1),
             None => 0,
         };
         self.list_state.select(Some(i));
     }
 
     fn prev_article(&mut self) {
-        if self.articles.is_empty() {
+        let len = self.visible_articles().len();
+        if len == 0 {
             return;
         }
         let i = match self.list_state.selected() {
@@ -167,15 +185,46 @@ impl App {
         self.list_state.select(Some(i));
     }
 
+    fn apply_filter(&mut self) {
+        if self.search_query.is_empty() {
+            self.filtered_articles.clear();
+        } else {
+            let q = self.search_query.to_lowercase();
+            self.filtered_articles = self
+                .all_articles
+                .iter()
+                .filter(|a| {
+                    a.title.to_lowercase().contains(&q)
+                        || a.description.to_lowercase().contains(&q)
+                        || a.source.to_lowercase().contains(&q)
+                })
+                .cloned()
+                .collect();
+        }
+        if self.visible_articles().is_empty() {
+            self.list_state.select(None);
+        } else {
+            self.list_state.select(Some(0));
+        }
+    }
+
+    fn clear_search(&mut self) {
+        self.search_active = false;
+        self.search_query.clear();
+        self.filtered_articles.clear();
+        if !self.all_articles.is_empty() {
+            self.list_state.select(Some(0));
+        }
+    }
+
     fn populate(&mut self, mut all: Vec<Article>) {
         all.sort_by(|a, b| b.parsed_date.cmp(&a.parsed_date));
 
         self.breaking = all.iter().take(self.breaking_count).cloned().collect();
-        self.articles = all.into_iter().skip(self.breaking_count).collect();
+        self.all_articles = all.into_iter().skip(self.breaking_count).collect();
 
-        if !self.articles.is_empty() && self.list_state.selected().is_none() {
-            self.list_state.select(Some(0));
-        }
+        self.apply_filter();
+
         self.last_updated = Some(Utc::now());
         self.loading = false;
         self.error = None;
@@ -286,7 +335,7 @@ fn ui(f: &mut Frame, app: &App) {
 
     render_header(f, app, outer[0]);
 
-    if app.loading && app.articles.is_empty() {
+    if app.loading && app.all_articles.is_empty() {
         let spinner = app.spinner();
         let loading = Paragraph::new(Line::from(vec![
             Span::styled(format!("  {spinner} "), Style::default().fg(theme::SPINNER)),
@@ -461,30 +510,71 @@ fn render_list(f: &mut Frame, app: &App, area: Rect) {
     let inner = block.inner(area);
     f.render_widget(block, area);
 
+    let search_height = if app.search_active || !app.search_query.is_empty() {
+        2
+    } else {
+        0
+    };
+
     let layout = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(2), Constraint::Min(0)])
+        .constraints([
+            Constraint::Length(search_height),
+            Constraint::Length(2),
+            Constraint::Min(0),
+        ])
         .split(inner);
 
-    let section_title = Line::from(vec![
-        Span::styled(
-            " LATEST NEWS ",
-            Style::default()
-                .fg(theme::FG_MUTED)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
-            format!(" {} articles", app.articles.len()),
-            Style::default().fg(theme::FG_DIM),
-        ),
-    ]);
+    // Search bar
+    if search_height > 0 {
+        let cursor = if app.search_active { "▊" } else { "" };
+        let search_line = Line::from(vec![
+            Span::styled(" / ", Style::default().fg(theme::SPINNER).add_modifier(Modifier::BOLD)),
+            Span::styled(&app.search_query, Style::default().fg(Color::White)),
+            Span::styled(cursor, Style::default().fg(theme::SPINNER)),
+        ]);
+        let search_block = Block::default()
+            .borders(Borders::BOTTOM)
+            .border_style(Style::default().fg(theme::BORDER));
+        let search = Paragraph::new(search_line).block(search_block);
+        f.render_widget(search, layout[0]);
+    }
+
+    let visible = app.visible_articles();
+
+    let section_title = if !app.search_query.is_empty() {
+        Line::from(vec![
+            Span::styled(
+                " SEARCH RESULTS ",
+                Style::default()
+                    .fg(theme::SPINNER)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!(" {} matches", visible.len()),
+                Style::default().fg(theme::FG_DIM),
+            ),
+        ])
+    } else {
+        Line::from(vec![
+            Span::styled(
+                " LATEST NEWS ",
+                Style::default()
+                    .fg(theme::FG_MUTED)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!(" {} articles", visible.len()),
+                Style::default().fg(theme::FG_DIM),
+            ),
+        ])
+    };
     f.render_widget(
         Paragraph::new(section_title).block(Block::default().padding(Padding::new(0, 0, 0, 0))),
-        layout[0],
+        layout[1],
     );
 
-    let items: Vec<ListItem> = app
-        .articles
+    let items: Vec<ListItem> = visible
         .iter()
         .map(|article| {
             let age = article.age_label();
@@ -514,7 +604,7 @@ fn render_list(f: &mut Frame, app: &App, area: Rect) {
         )
         .highlight_symbol(" ▌");
 
-    f.render_stateful_widget(list, layout[1], &mut app.list_state.clone());
+    f.render_stateful_widget(list, layout[2], &mut app.list_state.clone());
 }
 
 fn render_detail(f: &mut Frame, app: &App, breaking_area: Rect, list_area: Rect) {
@@ -615,11 +705,21 @@ fn render_detail(f: &mut Frame, app: &App, breaking_area: Rect, list_area: Rect)
 
 fn render_footer(f: &mut Frame, app: &App, area: Rect) {
     let help = match app.view {
+        View::List if app.search_active => vec![
+            Span::styled(" Type ", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+            Span::styled("to filter  ", Style::default().fg(theme::FG_DIM)),
+            Span::styled("Esc ", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+            Span::styled("clear search  ", Style::default().fg(theme::FG_DIM)),
+            Span::styled("Enter ", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+            Span::styled("done", Style::default().fg(theme::FG_DIM)),
+        ],
         View::List => vec![
             Span::styled(" ↑/↓ j/k ", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
             Span::styled("navigate  ", Style::default().fg(theme::FG_DIM)),
             Span::styled("Enter ", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
             Span::styled("read  ", Style::default().fg(theme::FG_DIM)),
+            Span::styled("/ ", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+            Span::styled("search  ", Style::default().fg(theme::FG_DIM)),
             Span::styled("r ", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
             Span::styled("refresh  ", Style::default().fg(theme::FG_DIM)),
             Span::styled("q ", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
@@ -716,6 +816,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             result = poll_event() => {
                 if let Some(key_code) = result {
                     match app.view {
+                        View::List if app.search_active => match key_code {
+                            KeyCode::Esc => {
+                                app.clear_search();
+                            }
+                            KeyCode::Enter => {
+                                app.search_active = false;
+                            }
+                            KeyCode::Backspace => {
+                                app.search_query.pop();
+                                app.apply_filter();
+                            }
+                            KeyCode::Char(c) => {
+                                app.search_query.push(c);
+                                app.apply_filter();
+                            }
+                            KeyCode::Down => app.next_article(),
+                            KeyCode::Up => app.prev_article(),
+                            _ => {}
+                        },
                         View::List => match key_code {
                             KeyCode::Char('q') => break,
                             KeyCode::Down | KeyCode::Char('j') => app.next_article(),
@@ -725,6 +844,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     app.scroll_offset = 0;
                                     app.view = View::Detail;
                                 }
+                            }
+                            KeyCode::Char('/') => {
+                                app.search_active = true;
+                                app.search_query.clear();
                             }
                             KeyCode::Char('r') => {
                                 if !app.loading {
